@@ -1,0 +1,64 @@
+# nQ-Swap DEX Monitor — Docker Compose
+#
+# Services:
+#   mock-rpc   — Mock blockchain RPC server (finalized blocks)
+#   mock-ws    — Mock mempool WebSocket server (pending transactions)
+#   app        — Next.js dashboard + tRPC WebSocket server
+#
+# Usage:
+#   docker-compose up --build
+#   Open http://localhost:3000 in your browser
+
+version: '3.8'
+
+services:
+  # Mock RPC Server (finalized blockchain state)
+  mock-rpc:
+    build:
+      context: ./mock-servers
+      dockerfile: Dockerfile
+    command: node rpc-server.js
+    ports:
+      - "4001:4001"
+    environment:
+      - PORT=4001
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:4001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  # Mock WebSocket Mempool Server
+  mock-ws:
+    build:
+      context: ./mock-servers
+      dockerfile: Dockerfile
+    command: node ws-server.js
+    ports:
+      - "4002:4002"
+    environment:
+      - PORT=4002
+      - EMISSION_RATE=50
+    restart: unless-stopped
+
+  # Next.js Application + tRPC WebSocket Server
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+      - "3001:3001"
+    environment:
+      - PORT=3000
+      - WS_PORT=3001
+      - RPC_URL=http://mock-rpc:4001
+      - WS_MEMPOOL_URL=ws://mock-ws:4002
+      - NODE_ENV=production
+    depends_on:
+      mock-rpc:
+        condition: service_healthy
+      mock-ws:
+        condition: service_started
+    restart: unless-stopped

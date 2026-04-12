@@ -1,0 +1,14 @@
+{
+  "name": "nq-swap-mock-servers",
+  "version": "1.0.0",
+  "description": "Mock RPC and WebSocket servers for nQ-Swap DEX monitoring",
+  "scripts": {
+    "rpc": "node rpc-server.js",
+    "ws": "node ws-server.js",
+    "start": "node start.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "ws": "^8.18.0"
+  }
+}

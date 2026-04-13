@@ -65,18 +65,6 @@ function PoolCardComponent({ pool, isSelected, onSelect }: PoolCardProps) {
         {formatPrice(displayPrice)}
       </div>
 
-      {/* Row 2: Volume/TVL + 24h Change */}
-      <div className="pool-card__meta">
-        <span>
-          <span className="pool-card__vol-label">VOL </span>
-          {formatCompact(pool.volume24h)}
-        </span>
-        <span>
-          <span className="pool-card__vol-label">TVL </span>
-          {formatCompact(pool.tvl)}
-        </span>
-      </div>
-
       <div className={`pool-card__change ${change >= 0 ? 'pool-card__change--positive' : 'pool-card__change--negative'}`}>
         {change >= 0 ? '+' : ''}{change.toFixed(2)}%
       </div>

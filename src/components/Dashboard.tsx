@@ -175,7 +175,13 @@ export function Dashboard() {
             <div className="chart-header__pool-info">
               <span className="chart-header__pair">{poolLabel}</span>
               <span
-                className={`chart-header__price ${isPending ? 'chart-header__price--pending' : 'chart-header__price--confirmed'}`}
+                className={`chart-header__price ${
+                  isPending
+                    ? 'chart-header__price--pending'
+                    : (selectedPool.priceChange24h || 0) >= 0
+                      ? 'chart-header__price--positive'
+                      : 'chart-header__price--negative'
+                }`}
               >
                 {formatPriceDisplay(displayPrice)}
               </span>

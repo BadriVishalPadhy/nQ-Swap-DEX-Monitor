@@ -16,9 +16,11 @@ import { useEffect, useRef, useState, memo } from 'react';
 import {
   createChart,
   CandlestickSeries,
+  HistogramSeries,
   type IChartApi,
   type ISeriesApi,
   type CandlestickData as LWCandlestickData,
+  type HistogramData,
   ColorType,
   CrosshairMode,
 } from 'lightweight-charts';
@@ -43,6 +45,7 @@ function CandlestickChartComponent({
   const chartRef = useRef<IChartApi | null>(null);
   const seriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
   const pendingSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
+  const volumeSeriesRef = useRef<ISeriesApi<'Histogram'> | null>(null);
   const [chartReady, setChartReady] = useState(false);
 
   // Initialize chart — runs once when container is available
@@ -68,23 +71,24 @@ function CandlestickChartComponent({
         horzLines: { color: 'rgba(255, 255, 255, 0.03)' },
       },
       crosshair: {
-        mode: CrosshairMode.Normal,
+        mode: CrosshairMode.Magnet,
         vertLine: {
-          color: 'rgba(99, 102, 241, 0.3)',
+          color: 'rgba(99, 102, 241, 0.5)',
           width: 1,
-          style: 2,
+          style: 1,
           labelBackgroundColor: '#6366f1',
         },
         horzLine: {
-          color: 'rgba(99, 102, 241, 0.3)',
+          color: 'rgba(99, 102, 241, 0.5)',
           width: 1,
-          style: 2,
+          style: 1,
           labelBackgroundColor: '#6366f1',
         },
       },
       rightPriceScale: {
         borderColor: 'rgba(255, 255, 255, 0.06)',
-        scaleMargins: { top: 0.1, bottom: 0.1 },
+        scaleMargins: { top: 0.1, bottom: 0.25 },
+        autoScale: true,
       },
       timeScale: {
         borderColor: 'rgba(255, 255, 255, 0.06)',
@@ -95,7 +99,16 @@ function CandlestickChartComponent({
       handleScroll: { mouseWheel: true, pressedMouseMove: true },
     });
 
-    // Confirmed candles series (v5 unified API)
+    // Volume series (overlaid at bottom)
+    const volumeSeries = chart.addSeries(HistogramSeries, {
+      priceFormat: { type: 'volume' },
+      priceScaleId: '',
+    });
+    volumeSeries.priceScale().applyOptions({
+      scaleMargins: { top: 0.75, bottom: 0 },
+    });
+
+    // Confirmed candles series
     const series = chart.addSeries(CandlestickSeries, {
       upColor: '#10b981',
       downColor: '#ef4444',
@@ -103,9 +116,12 @@ function CandlestickChartComponent({
       borderDownColor: '#ef4444',
       wickUpColor: '#10b981',
       wickDownColor: '#ef4444',
+      priceLineVisible: true,
+      priceLineColor: '#10b981',
+      priceLineWidth: 2,
     });
 
-    // Pending candle series (overlaid with distinct styling)
+    // Pending candle series
     const pendingSeries = chart.addSeries(CandlestickSeries, {
       upColor: 'rgba(245, 158, 11, 0.7)',
       downColor: 'rgba(245, 158, 11, 0.4)',
@@ -113,11 +129,13 @@ function CandlestickChartComponent({
       borderDownColor: 'rgba(245, 158, 11, 0.6)',
       wickUpColor: 'rgba(245, 158, 11, 0.7)',
       wickDownColor: 'rgba(245, 158, 11, 0.5)',
+      priceLineVisible: false,
     });
 
     chartRef.current = chart;
     seriesRef.current = series;
     pendingSeriesRef.current = pendingSeries;
+    volumeSeriesRef.current = volumeSeries;
     setChartReady(true);
 
     // Handle resize
@@ -137,6 +155,7 @@ function CandlestickChartComponent({
       chartRef.current = null;
       seriesRef.current = null;
       pendingSeriesRef.current = null;
+      volumeSeriesRef.current = null;
       setChartReady(false);
     };
   }, []); // Container is always rendered, so this runs on mount
@@ -153,8 +172,15 @@ function CandlestickChartComponent({
         low: c.low,
         close: c.close,
       }));
+      
+      const volumeData: HistogramData[] = candles.map(c => ({
+        time: c.time as unknown as HistogramData['time'],
+        value: c.volume ?? 0,
+        color: c.close >= c.open ? 'rgba(16, 185, 129, 0.3)' : 'rgba(239, 68, 68, 0.3)',
+      }));
 
       seriesRef.current.setData(formatted);
+      volumeSeriesRef.current?.setData(volumeData);
 
       // Auto-scroll to latest
       if (chartRef.current) {
@@ -177,6 +203,13 @@ function CandlestickChartComponent({
           high: pendingCandle.high,
           low: pendingCandle.low,
           close: pendingCandle.close,
+        });
+
+        // Also update volume bar for the pending candle
+        volumeSeriesRef.current?.update({
+          time: pendingCandle.time as unknown as HistogramData['time'],
+          value: pendingCandle.volume ?? 0,
+          color: pendingCandle.close >= pendingCandle.open ? 'rgba(245, 158, 11, 0.4)' : 'rgba(245, 158, 11, 0.2)',
         });
       } catch {
         // Ignore update errors (e.g., time ordering issues)

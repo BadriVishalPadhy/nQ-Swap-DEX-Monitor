@@ -94,30 +94,99 @@ The system is designed around a **three-layer architecture** that cleanly separa
 1. **Not cause cascade re-renders** — Only components consuming changed data should re-render
 2. **Support high-frequency `set()` calls** — The store must handle rapid mutations without queueing/batching overhead
 3. **Be memory-efficient** — No action objects, no middleware chains, no dev-time-only features eating memory
-4. **Work with concurrent mode** — React 18's concurrent rendering can cause "tearing" with naive external stores
+4. **Work with concurrent mode** — React 18/19's concurrent rendering can cause "tearing" with naive external stores
 
-**Zustand excels here because:**
+#### Why Not Redux?
 
-- **Selective subscriptions**: `usePoolStore(s => s.pools.get(selectedPoolId))` — only the component displaying Pool #3 re-renders when Pool #3 changes. Redux requires `shallowEqual` selectors or `reselect` for this.
+Redux is a great general-purpose state manager, but it introduces overhead that becomes measurable at 1,000 updates/sec:
 
-- **Built on `useSyncExternalStore`**: This is React's official primitive for external stores in concurrent mode. It prevents tearing by guaranteeing all components see a consistent state snapshot during renders.
+- Every state change dispatches an **action object** → garbage collection pressure
+- The **reducer function** is called synchronously → blocks the main thread
+- `useSelector` with object returns triggers re-renders unless you wire up `shallowEqual` or `reselect` for every consumer
+- The `<Provider>` context wrapper causes React to check every connected component on the tree
 
-- **Zero boilerplate**: No action creators, no reducers, no dispatch. A `set()` call is a direct mutation. This matters when you're calling `set()` 60 times per second.
+For a dashboard that updates 60x/sec, these milliseconds compound into visible jank.
 
-- **No provider nesting**: Zustand stores are module-level singletons. No `<Provider>` wrapping required. This eliminates context propagation overhead.
+#### Why Not React Context?
+
+Context is designed for low-frequency global values (theme, locale, auth). It has a fundamental flaw for high-frequency data: **any Context value change re-renders every consumer**, regardless of whether they care about the specific piece that changed. There is no selector mechanism. With 10 pool cards subscribed to a single Context containing all pools, a price change in Pool #1 would re-render all 10 cards.
+
+#### Why Zustand Wins
+
+**Zustand excels here because of four properties:**
+
+1. **Selective subscriptions** — Each component subscribes to the exact slice it needs:
+
+```typescript
+// From src/components/PoolTable.tsx — subscribes to the full Map
+const pools = usePoolStore(s => s.pools);
+
+// From src/components/BlockStatus.tsx — subscribes to a single number
+const lastFinalizedBlock = usePoolStore(s => s.lastFinalizedBlock);
+
+// From src/components/Dashboard.tsx — subscribes to one pool by ID
+const selectedPool = usePoolStore(s =>
+  s.selectedPoolId ? s.pools.get(s.selectedPoolId) : null
+);
+```
+
+When Pool #3 updates, only the Pool #3 card and the Dashboard (if Pool #3 is selected) re-render. Pool #1 through #9 do nothing.
+
+2. **Built on `useSyncExternalStore`** — This is React's official primitive for external stores in concurrent mode. It prevents "tearing" (components seeing different state snapshots in the same render pass) by guaranteeing all components see a consistent snapshot.
+
+3. **Zero boilerplate** — No action creators, no reducers, no dispatch. A `set()` call is a direct mutation:
+
+```typescript
+// From src/stores/pool-store.ts — direct mutation, no dispatch
+applyUpdate: (update) => {
+  const { pools } = get();
+  const newPools = new Map(pools);
+  newPools.set(update.poolId, updatedPool);
+  set({ pools: newPools });
+},
+```
+
+4. **No provider nesting** — Zustand stores are module-level singletons. No `<Provider>` wrapping required. This eliminates context propagation overhead and makes stores usable outside React (e.g., in the WebSocket handler).
 
 ### Store Architecture
 
-I split state into two stores:
+I split state into **two stores** to isolate re-render domains:
 
-- **`pool-store`**: Pool metadata, prices, connection status. Updated by tRPC subscription events.
-- **`chart-store`**: OHLC candlestick data per pool. Updated by the Web Worker's processed results.
+| Store | Data | Update Source | Update Frequency |
+|-------|------|---------------|------------------|
+| `pool-store` | Pool metadata, prices, connection status | tRPC subscription | ~60/sec (throttled) |
+| `chart-store` | OHLC candlestick data per pool | Web Worker results | ~60/sec (throttled) |
 
-This separation ensures that chart data updates (frequent, large) don't cause re-renders in the pool table, and vice versa. Each component subscribes to the exact slice it needs.
+This separation ensures that chart data mutations (which are frequent and involve large arrays) don't trigger re-render checks in pool table components, and vice versa.
+
+### Pitfall Encountered: `getServerSnapshot` Infinite Loop
+
+During development, a critical bug surfaced with Zustand selectors in Next.js. The selector in `useChartData`:
+
+```typescript
+// ❌ BUG: Creates a new [] reference every render → infinite loop
+const candles = useChartStore(s =>
+  selectedPoolId ? s.confirmedCandles.get(selectedPoolId) || [] : []
+);
+```
+
+Because `|| []` creates a **new array reference** every time the selector runs, React's `useSyncExternalStore` detects the "server snapshot" as always different, causing an infinite re-render loop. The fix:
+
+```typescript
+// ✅ FIX: Stable empty reference, no new object created
+const EMPTY_CANDLES: CandlestickData[] = [];
+
+const candles = useChartStore(s => {
+  if (!selectedPoolId) return EMPTY_CANDLES;
+  return s.confirmedCandles.get(selectedPoolId) ?? EMPTY_CANDLES;
+});
+```
+
+This is a non-obvious Zustand + Next.js pitfall that would not occur with Redux (which uses reference equality checks differently).
 
 ### Throttling Strategy
 
-The subscription handler batches pending updates at a 60fps cap using `performance.now()` comparisons. This means even if the WebSocket delivers 1,000 updates/sec, the React tree is only asked to reconcile ~60 times/sec. The updates are not lost — they're processed by the worker and aggregated into OHLC bars. Only the visual updates are throttled.
+The subscription handler batches pending updates at a 60fps cap using `performance.now()` comparisons. This means even if the WebSocket delivers 1,000 updates/sec, the React tree is only asked to reconcile ~60 times/sec. The updates are not lost — they're processed by the worker and aggregated into OHLC bars. Only the visual DOM updates are throttled.
 
 ---
 
@@ -222,33 +291,137 @@ The dashboard includes a built-in FPS counter using `requestAnimationFrame` samp
 
 ---
 
-## 5. Web Worker Design & Memory Leak Prevention
+## 5. WebSocket Memory Leak Prevention
 
-### Worker Lifecycle
+WebSocket connections are a notorious source of memory leaks in real-time applications. Data arrives continuously, listeners accumulate, and buffers grow without bound. This project addresses memory leaks at **five distinct layers**:
+
+### Layer 1: Backend — Mempool Listener Cleanup
+
+The `MempoolListener` service (`src/server/services/mempool-listener.ts`) manages the raw WebSocket connection to the mempool. It has three leak-prevention mechanisms:
 
 ```typescript
-// Initialization (useEffect mount)
-const worker = new Worker(new URL('...'), { type: 'module' });
-const api = Comlink.wrap(worker);
+// From mempool-listener.ts — Bounded pending buffer
+private pendingTxs = new Map<string, PendingTransaction>();
+private readonly MAX_PENDING = 5000;
 
-// Cleanup (useEffect return / unmount)
-await api.cleanup();  // Clear internal buffers
-worker.terminate();    // Kill the thread
+// When buffer is full, oldest entries are evicted
+if (this.pendingTxs.size >= this.MAX_PENDING) {
+  const oldest = this.pendingTxs.keys().next().value;
+  this.pendingTxs.delete(oldest);
+}
 ```
 
-**Critical**: `worker.terminate()` is called in the `useEffect` cleanup function. If the user navigates away or the component unmounts, the worker thread is immediately killed, releasing all its memory.
+**TTL Eviction**: A periodic sweep (every 30 seconds) removes pending transactions older than 2 minutes. Without this, a long-running server would accumulate thousands of stale entries:
 
-### Memory Safety Mechanisms
+```typescript
+// Periodic cleanup of stale pending transactions
+this.cleanupInterval = setInterval(() => {
+  const cutoff = Date.now() - this.TX_TTL;
+  for (const [hash, tx] of this.pendingTxs) {
+    if (tx.timestamp < cutoff) this.pendingTxs.delete(hash);
+  }
+}, 30_000);
+```
 
-1. **Circular Tick Buffer**: Each pool maintains a fixed-size buffer of max 10,000 ticks. When the buffer is full, the oldest entries are evicted. This prevents unbounded growth from continuous streaming data.
+**Reconnection Cleanup**: When the WebSocket disconnects and reconnects, the old connection's event listeners are removed before new ones are attached. The `cleanup()` method clears `this.ws.removeAllListeners()` and `clearInterval(this.cleanupInterval)` to prevent dangling closures from the previous connection.
 
-2. **Candle Window Pruning**: Only the last 300 candles (configurable via `MAX_CANDLES`) are retained per pool per interval. Historical data beyond the visible chart window is pruned.
+### Layer 2: Backend — Block Reconciliation
 
-3. **Pending Transaction TTL**: The backend's mempool listener evicts pending transactions older than 2 minutes. This prevents stale mempool data from accumulating indefinitely.
+When a finalized block arrives from the RPC, the mempool listener performs **reconciliation** — it evicts all pending transactions that were included in the block:
 
-4. **WebSocket Reconnection Cleanup**: When the WebSocket reconnects, the old connection's event listeners are properly removed before new ones are attached. No dangling closures.
+```typescript
+// From mempool-listener.ts — reconcileBlock()
+reconcileBlock(blockNumber: number, confirmedTxHashes: string[]) {
+  for (const hash of confirmedTxHashes) {
+    this.pendingTxs.delete(hash);  // Remove confirmed txns from pending buffer
+  }
+  this.emit('reconciled', { blockNumber, evicted: confirmedTxHashes.length });
+}
+```
 
-5. **Chart Instance Disposal**: When the `CandlestickChart` component unmounts, `chart.remove()` is called to properly dispose the lightweight-charts instance. The `ResizeObserver` is also disconnected.
+This prevents the pending buffer from growing indefinitely even when the WebSocket stream is faster than finalization.
+
+### Layer 3: Web Worker — Bounded Circular Buffers
+
+The Web Worker (`src/workers/data-processor.worker.ts`) processes every tick off the main thread. Its internal state uses **fixed-size buffers** with hard constants:
+
+```typescript
+// From data-processor.worker.ts — Hard memory ceilings
+const MAX_TICKS_PER_POOL = 10_000;   // Circular tick buffer
+const MAX_CANDLES = 300;              // Per pool, per interval
+
+// When tick buffer is full, oldest entries are evicted (FIFO)
+if (tickBuffer.length >= MAX_TICKS_PER_POOL) {
+  tickBuffer.shift();  // O(1) amortized with circular index
+}
+tickerBuffer.push(newTick);
+
+// Candle array is pruned to window
+if (candles.length > MAX_CANDLES) {
+  candles = candles.slice(-MAX_CANDLES);
+}
+```
+
+**Why this matters**: Without these bounds, a WebSocket emitting 1,000 ticks/sec would accumulate 3.6 million entries per hour per pool. With 10 pools, that's 36 million objects in memory. The circular buffer caps this at 100,000 total (10 pools × 10,000 ticks).
+
+### Layer 4: Web Worker — Lifecycle Management
+
+The `useWorker` hook (`src/hooks/useWorker.ts`) manages the Worker thread's entire lifecycle:
+
+```typescript
+// From src/hooks/useWorker.ts
+useEffect(() => {
+  const worker = new Worker(
+    new URL('../workers/data-processor.worker.ts', import.meta.url),
+    { type: 'module' }
+  );
+  const api = Comlink.wrap<WorkerAPI>(worker);
+
+  // ... initialization ...
+
+  return () => {
+    // CRITICAL: This runs on unmount (navigation, HMR, tab close)
+    api[Comlink.releaseProxy]();  // Release the Comlink proxy
+    worker.terminate();            // Kill the thread + free all its memory
+  };
+}, []);
+```
+
+`worker.terminate()` is the nuclear option — it immediately stops the thread and releases **all** memory allocated within it (tick buffers, candle arrays, internal state). This is called in the `useEffect` cleanup function, ensuring it fires on:
+- Component unmount (navigation)
+- Hot Module Replacement (during development)
+- Page unload
+
+### Layer 5: Frontend — Chart & Observer Disposal
+
+The `CandlestickChart` component (`src/components/CandlestickChart.tsx`) creates a `ResizeObserver` and a `lightweight-charts` instance. Both hold references that prevent garbage collection if not explicitly cleaned up:
+
+```typescript
+// From src/components/CandlestickChart.tsx
+useEffect(() => {
+  const chart = createChart(containerRef.current, { /* ... */ });
+  const resizeObserver = new ResizeObserver(/* ... */);
+  resizeObserver.observe(containerRef.current);
+
+  return () => {
+    resizeObserver.disconnect();  // Stop observing → release DOM references
+    chart.remove();               // Dispose canvas, WebGL context, internal state
+    chartRef.current = null;      // Clear refs → allow GC
+    seriesRef.current = null;
+    pendingSeriesRef.current = null;
+  };
+}, []);
+```
+
+### Summary: Defense in Depth
+
+| Layer | Mechanism | What It Prevents |
+|-------|-----------|------------------|
+| Backend Mempool | Bounded Map (5,000 max) + TTL eviction | Unbounded pending tx accumulation |
+| Backend Reconciliation | Block-based eviction | Stale pending data after finalization |
+| Web Worker Buffers | Circular buffer (10K) + candle pruning (300) | Unbounded tick/candle growth |
+| Worker Lifecycle | `worker.terminate()` on unmount | Orphaned background threads |
+| Chart Disposal | `chart.remove()` + `observer.disconnect()` | Canvas/WebGL memory leaks |
 
 ### Why Comlink over raw postMessage
 

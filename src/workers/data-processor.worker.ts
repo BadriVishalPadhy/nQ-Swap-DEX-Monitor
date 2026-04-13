@@ -129,6 +129,11 @@ const workerApi = {
       const lastCandle = candles[candles.length - 1];
       if (lastCandle && lastCandle.time === candleTimeSec) {
         // Update existing confirmed candle
+        if (existingPending && existingPending.time === candleTimeSec) {
+          lastCandle.high = Math.max(lastCandle.high, existingPending.high);
+          lastCandle.low = Math.min(lastCandle.low, existingPending.low);
+          lastCandle.volume += existingPending.volume;
+        }
         lastCandle.high = Math.max(lastCandle.high, tick.price);
         lastCandle.low = Math.min(lastCandle.low, tick.price);
         lastCandle.close = tick.price;
@@ -137,13 +142,25 @@ const workerApi = {
         confirmedCandle = { ...lastCandle };
       } else {
         // New confirmed candle
+        let open = tick.price;
+        let high = tick.price;
+        let low = tick.price;
+        let volume = tick.amount || 0;
+        
+        if (existingPending && existingPending.time === candleTimeSec) {
+          open = existingPending.open;
+          high = Math.max(existingPending.high, tick.price);
+          low = Math.min(existingPending.low, tick.price);
+          volume += existingPending.volume;
+        }
+
         confirmedCandle = {
           time: candleTimeSec,
-          open: tick.price,
-          high: tick.price,
-          low: tick.price,
+          open,
+          high,
+          low,
           close: tick.price,
-          volume: tick.amount || 0,
+          volume,
           confirmationStatus: 'finalized',
         };
         candles.push(confirmedCandle);
@@ -265,7 +282,8 @@ const workerApi = {
     let price = basePrice * (0.95 + Math.random() * 0.1);
 
     for (let i = count; i > 0; i--) {
-      const time = Math.floor((now - i * intervalMs) / 1000);
+      const alignedNow = Math.floor(now / intervalMs) * intervalMs;
+      const time = Math.floor((alignedNow - i * intervalMs) / 1000);
       const volatility = 0.005 + Math.random() * 0.01;
       const open = price;
       const change = (Math.random() - 0.5) * 2 * volatility * price;
